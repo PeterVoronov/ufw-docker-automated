@@ -31,6 +31,31 @@ func DeleteUfwRule(containerID <-chan string, c *cache.Cache) {
 					}
 				}
 			}
+
+			// Handle host-outbound rules
+			for _, rule := range container.UfwHostOutboundRules {
+				for dnetwork, containerIP := range container.IPAddressMap {
+					var cmd *exec.Cmd
+					if rule.Port == "" {
+						cmd = exec.Command("sudo", "ufw", "delete", "allow", "from", containerIP, "to", rule.CIDR, "comment", container.Name+"-to-host:"+id+rule.Comment)
+					} else {
+						cmd = exec.Command("sudo", "ufw", "delete", "allow", "from", containerIP, "to", rule.CIDR, "port", rule.Port, "comment", container.Name+"-to-host:"+id+rule.Comment)
+					}
+					log.Info().Msg("ufw-docker-automated: Deleting host-outbound rule (docker network :" + dnetwork + "): " + cmd.String())
+
+					var stdout, stderr bytes.Buffer
+					cmd.Stdout = &stdout
+					cmd.Stderr = &stderr
+					err := cmd.Run()
+
+					if err != nil || stderr.String() != "" {
+						log.Error().Err(err).Msg("ufw error: " + stderr.String())
+					} else {
+						log.Info().Msg("ufw: " + stdout.String())
+					}
+				}
+			}
+
 			// Handle outbound rules
 			for _, rule := range container.UfwOutboundRules {
 				for dnetwork, containerIP := range container.IPAddressMap {
