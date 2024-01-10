@@ -26,10 +26,20 @@ func CreateUfwRule(ch <-chan *types.ContainerJSON, c *cache.Cache) {
 	for container := range ch {
 		containerName := strings.Replace(container.Name, "/", "", 1) // container name appears with prefix "/"
 		containerID := container.ID[:12]
+		containerInHostNetwork := false
 		containerIPs := map[string]string{}
 		// Works for both docker-compose and docker run
 		for networkName, network := range container.NetworkSettings.Networks {
+			if networkName == "host" {
+				containerInHostNetwork = true
+				break
+			}
 			containerIPs[networkName] = network.IPAddress
+		}
+
+		if containerInHostNetwork {
+			log.Warn().Msg("ufw-docker-automated: Skipping container '" + containerName + "' in host network.")
+			continue
 		}
 
 		if len(containerIPs) == 0 {
@@ -108,6 +118,73 @@ func CreateUfwRule(ch <-chan *types.ContainerJSON, c *cache.Cache) {
 				// ufw route allow proto <tcp|udp> <source> to <container_ip> port <port> comment <comment>
 				// ufw route delete allow proto tcp from any to 172.17.0.2 port 80 comment "Comment"
 				// ufw route delete allow proto <tcp|udp> <source> to <container_ip> port <port> comment <comment>
+			}
+		}
+
+		// Handle host-ip outbound rules
+		if container.Config.Labels["UFW_HOST_ALLOW"] == "TRUE" {
+			if container.Config.Labels["UFW_HOST_ALLOW_TO"] != "" {
+				ufwRules := []UfwRule{}
+				ufwAllowToLabelParsed := strings.Split(container.Config.Labels["UFW_HOST_ALLOW_TO"], ";")
+
+				for _, allowTo := range ufwAllowToLabelParsed {
+					ip := strings.Split(allowTo, "-")
+
+					// First element should be always valid IP Address or CIDR
+					if !checkIP(ip[0]) {
+						if !checkCIDR(ip[0]) {
+							log.Printf("ufw-docker-automated: Address %s is not valid!\n", ip[0])
+							continue
+						}
+					}
+
+					// Example: 172.10.5.0-LAN or 172.10.5.0-80
+					if len(ip) == 2 {
+						if _, err := strconv.Atoi(ip[1]); err == nil {
+							// case: 172.10.5.0-80
+							ufwRules = append(ufwRules, UfwRule{CIDR: ip[0], Port: ip[1]})
+						} else {
+							// case: 172.10.5.0-LAN
+							ufwRules = append(ufwRules, UfwRule{CIDR: ip[0], Comment: fmt.Sprintf(" %s", ip[1])})
+						}
+						// Example: 172.10.5.0-80-LAN
+					} else if len(ip) == 3 {
+						ufwRules = append(ufwRules, UfwRule{CIDR: ip[0], Port: ip[1], Comment: fmt.Sprintf(" %s", ip[2])})
+					} else {
+						// Example: 172.10.5.0
+						ufwRules = append(ufwRules, UfwRule{CIDR: ip[0]})
+					}
+				}
+
+				for _, rule := range ufwRules {
+					var cmd *exec.Cmd
+
+					for dnetwork, containerIP := range containerIPs {
+						if rule.Port == "" {
+							cmd = exec.Command("sudo", "ufw", "allow", "from", containerIP, "to", rule.CIDR, "comment", containerName+"-to-host:"+containerID+rule.Comment)
+						} else {
+							cmd = exec.Command("sudo", "ufw", "allow", "from", containerIP, "to", rule.CIDR, "port", rule.Port, "comment", containerName+"-to-host:"+containerID+rule.Comment)
+						}
+						log.Info().Msg("ufw-docker-automated: Adding host-outbound rule (docker network :" + dnetwork + "): " + cmd.String())
+
+						var stdout, stderr bytes.Buffer
+						cmd.Stdout = &stdout
+						cmd.Stderr = &stderr
+						err := cmd.Run()
+
+						if err != nil || stderr.String() != "" {
+							log.Error().Err(err).Msg("ufw error: " + stderr.String())
+						} else {
+							log.Info().Msg("ufw: " + stdout.String())
+						}
+					}
+				}
+
+				cachedContainer.UfwHostOutboundRules = append(cachedContainer.UfwHostOutboundRules, ufwRules...)
+				// ufw allow from <container_ip> to 172.17.0.1 port 80 comment "Comment"
+				// ufw allow from <container_ip> to 10.100.200.213 port 8099 comment "Comment"
+				// ufw delete allow from <container_ip> to 172.17.0.1 port 80 comment "Comment"
+				// ufw delete allow from <container_ip> to 10.100.200.213 port 8099 comment "Comment"
 			}
 		}
 
